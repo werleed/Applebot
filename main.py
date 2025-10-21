@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
+# main.py — Werleed Assistant (part 1/3)
 """
-Werleed Assistant - Full production-ready bot (Part 1 of 3)
-
-Features:
-- Twilio SMS primary OTP, Telegram fallback OTP
-- Phone normalization (+234/+233) and prompts
-- Local AI-like conversational replies, tone & mood
-- IMEI lookup via optional IMEI_API_KEY or web-scraping fallback
-- Daily briefing (weather + exchange rates)
-- Offline queue for OTPs and unsent messages with retry
-- Admin tools: /users, /stats, /broadcast, /logs, /maintenance
-- User features: mood detection, daily planner, feedback collection, mini-games placeholder
-- Persistence via SQLite + JSON backup
-- Keepalive server for Replit + optional pinger
+Render-ready Werleed Assistant:
+- Exposes FastAPI app variable (so uvicorn main:app works)
+- Runs the Telegram bot polling in a background thread
+- Twilio SMS primary OTP, Telegram fallback
+- Multilingual local AI heuristics, IMEI lookup, admin commands, offline retry queue
 """
 
 import os
-import re
 import time
 import json
 import random
@@ -25,9 +17,9 @@ import sqlite3
 import threading
 import requests
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, List
 
-# NLP & translation
+# Translation & NLP
 from deep_translator import GoogleTranslator
 from langdetect import detect, LangDetectException
 from bs4 import BeautifulSoup
@@ -35,12 +27,13 @@ from bs4 import BeautifulSoup
 # dotenv
 from dotenv import load_dotenv
 
-# telegram
+# FastAPI
+from fastapi import FastAPI
+import uvicorn
+
+# Telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 # Twilio
 try:
@@ -50,15 +43,7 @@ except Exception:
     TwilioClient = None
     TWILIO_AVAILABLE = False
 
-# FastAPI for keepalive
-try:
-    from fastapi import FastAPI
-    import uvicorn
-    FASTAPI_AVAILABLE = True
-except Exception:
-    FASTAPI_AVAILABLE = False
-
-# Optional OpenAI (disabled by default)
+# Optional OpenAI (disabled if key not present)
 try:
     import openai
     OPENAI_AVAILABLE = True
@@ -78,7 +63,7 @@ DAILY_BRIEF_HOUR = int(os.getenv("DAILY_BRIEF_HOUR") or 8)
 KEEPALIVE_URL = os.getenv("KEEPALIVE_URL") or ""
 BOT_NAME = os.getenv("BOT_NAME") or "Werleed Assistant"
 BACKUP_JSON = "users_backup.json"
-PORT = int(os.getenv("PORT") or os.getenv("REPL_PORT") or 3000)
+PORT = int(os.getenv("PORT") or os.getenv("REPL_PORT") or 10000)
 
 if not BOT_TOKEN:
     raise SystemExit("TELEGRAM_TOKEN missing in .env")
@@ -86,7 +71,7 @@ if not BOT_TOKEN:
 if OPENAI_AVAILABLE and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
-# Twilio client init
+# initialize Twilio client if credentials present
 twilio_client = None
 if TWILIO_AVAILABLE and TWILIO_SID and TWILIO_AUTH:
     try:
@@ -94,12 +79,12 @@ if TWILIO_AVAILABLE and TWILIO_SID and TWILIO_AUTH:
     except Exception:
         twilio_client = None
 
-# Logging
+# logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger("werleed_assistant")
 
-# SQLite DB init
-DB_FILE = "werleed_assistant_full.db"
+# sqlite DB
+DB_FILE = "werleed_assistant_render.db"
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cur = conn.cursor()
 
@@ -157,17 +142,15 @@ cur.execute("""CREATE TABLE IF NOT EXISTS logs (
 )""")
 conn.commit()
 
-# backup/restore
+# backup / restore helpers
 def backup_users_to_json():
     try:
         cur.execute("SELECT user_id,tg_name,phone,verified_at,lang,tone,mood,last_seen FROM users")
         rows = cur.fetchall()
         arr = []
         for r in rows:
-            arr.append({
-                "user_id": r[0], "tg_name": r[1], "phone": r[2], "verified_at": r[3],
-                "lang": r[4], "tone": r[5], "mood": r[6], "last_seen": r[7]
-            })
+            arr.append({"user_id": r[0], "tg_name": r[1], "phone": r[2], "verified_at": r[3],
+                        "lang": r[4], "tone": r[5], "mood": r[6], "last_seen": r[7]})
         with open(BACKUP_JSON, "w", encoding="utf-8") as f:
             json.dump(arr, f, indent=2)
         logger.info("Backed up %d users", len(arr))
@@ -182,9 +165,10 @@ def restore_users_from_json():
             arr = json.load(f)
         for u in arr:
             cur.execute("""INSERT INTO users(user_id,tg_name,phone,verified_at,lang,tone,mood,last_seen)
-                           VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
-                           tg_name=excluded.tg_name, phone=excluded.phone, verified_at=excluded.verified_at, lang=excluded.lang, tone=excluded.tone, mood=excluded.mood, last_seen=excluded.last_seen""",
-                        (u.get("user_id"), u.get("tg_name"), u.get("phone"), u.get("verified_at"), u.get("lang","en"), u.get("tone","friendly"), u.get("mood",""), u.get("last_seen",0)))
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+                tg_name=excluded.tg_name, phone=excluded.phone, verified_at=excluded.verified_at, lang=excluded.lang, tone=excluded.tone, mood=excluded.mood, last_seen=excluded.last_seen""",
+                        (u.get("user_id"), u.get("tg_name"), u.get("phone"), u.get("verified_at"),
+                         u.get("lang","en"), u.get("tone","friendly"), u.get("mood",""), u.get("last_seen",0)))
         conn.commit()
         logger.info("Restored %d users from backup", len(arr))
     except Exception:
@@ -252,11 +236,11 @@ def log(level:str, message:str):
     except Exception:
         logger.exception("log failed")
 
-def get_logs(limit=50)->List[Tuple[int,str,str,int]]:
+def get_logs(limit=50)->List[tuple]:
     cur.execute("SELECT id,level,message,ts FROM logs ORDER BY id DESC LIMIT ?", (limit,))
     return cur.fetchall()
 
-# helpers: phone normalization and Twilio OTP
+# Phone normalization
 DIAL_BY_COUNTRY = {"NG":"+234", "GH":"+233"}
 
 def normalize_phone(raw:str, hint_country:Optional[str]=None) -> Tuple[Optional[str], Optional[str]]:
@@ -289,8 +273,9 @@ def normalize_phone(raw:str, hint_country:Optional[str]=None) -> Tuple[Optional[
         return "+" + digits, None
     if len(digits) in (10,11) and digits.startswith("0"):
         return "+234" + digits[1:], None
-    return None, "Ambiguous number. Please send international format starting with + (e.g., +2348012345678)."# Part 2 of 3 — AI, IMEI, OTP, queues, keepalive
+    return None, "Ambiguous number. Please send international format starting with + (e.g., +2348012345678)."# main.py — part 2/3
 
+# Twilio send (SMS verify)
 def twilio_send_sms_verification(phone_e164:str) -> Tuple[bool,str]:
     if not twilio_client or not TWILIO_VERIFY_SID:
         return False, "Twilio not configured."
@@ -329,7 +314,7 @@ def add_planner_note(user_id:int, note:str, remind_at_ts:int):
     cur.execute("INSERT INTO planner(user_id,note,remind_at) VALUES(?,?,?)", (user_id, note, remind_at_ts))
     conn.commit()
 
-def get_due_plans(now_ts:int)->List[Tuple[int,int,str,int]]:
+def get_due_plans(now_ts:int)->List[tuple]:
     cur.execute("SELECT id,user_id,note,remind_at FROM planner WHERE remind_at <= ?", (now_ts,))
     return cur.fetchall()
 
@@ -397,7 +382,7 @@ def local_ai_reply(user_id:int, text:str)->str:
         loc = get_location_data()
         curc = loc.get("currency") or "NGN"
         return from_en(fetch_rate("USD", curc), lang)
-    # planner add
+    # planner add suggestion
     if t.startswith("remind me") or t.startswith("remind"):
         return from_en("Use the planner feature: send /plan <YYYY-MM-DD HH:MM> <note>", lang)
     # mood response
@@ -502,7 +487,7 @@ def fetch_rate(base="USD", target="NGN"):
     except Exception:
         return "Rate error"
 
-# offline retry threads
+# offline retry thread
 def retry_queues(app):
     while True:
         try:
@@ -546,23 +531,6 @@ def retry_queues(app):
         time.sleep(60)
 
 # keepalive server + pinger
-def start_keepalive_server():
-    if not FASTAPI_AVAILABLE:
-        logger.info("FastAPI not installed - skipping keepalive server")
-        return
-    app = FastAPI()
-    @app.get("/")
-    def root():
-        return {"status":"ok","bot":BOT_NAME}
-    def run_uvicorn():
-        try:
-            uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
-        except Exception:
-            logger.exception("uvicorn failed")
-    t = threading.Thread(target=run_uvicorn, daemon=True)
-    t.start()
-    logger.info("Keepalive server started")
-
 def start_keepalive_pinger():
     if not KEEPALIVE_URL:
         logger.info("KEEPALIVE_URL not set; skipping pinger")
@@ -576,7 +544,7 @@ def start_keepalive_pinger():
             time.sleep(9*60)
     t = threading.Thread(target=pinger, daemon=True)
     t.start()
-    logger.info("Keepalive pinger started")# Part 3 of 3 — handlers, admin, main
+    logger.info("Keepalive pinger started")# main.py — part 3/3
 
 # Telegram handlers
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -677,7 +645,7 @@ async def code_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Verification failed. The code is incorrect.")
 
-# planner, feedback, admin
+# planner, feedback, admin functions
 async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /plan <YYYY-MM-DD HH:MM> <note>")
@@ -711,7 +679,8 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("🚫 Access denied."); return
     cur.execute("SELECT user_id,tg_name,phone,verified_at FROM users ORDER BY verified_at DESC")
-    rows = cur.fetchall(); out=[]
+    rows = cur.fetchall()
+    out=[]
     for r in rows[:200]:
         uid,name,phone,vt = r
         vtstr = datetime.utcfromtimestamp(vt).strftime("%Y-%m-%d %H:%M") if vt else "Not verified"
@@ -744,7 +713,7 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out.append(f"{r[0]} [{r[1]}] {r[2]} ({datetime.utcfromtimestamp(r[3]).strftime('%Y-%m-%d %H:%M')})")
     await update.message.reply_text("\n".join(out) if out else "No logs")
 
-# main message handler - chat and flows
+# message handler
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user; uid = user.id
     text = (update.message.text or "").strip()
@@ -793,7 +762,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) >= 2 and all(len(p) == 3 and p.isalpha() for p in parts[:2]):
         r = fetch_rate(parts[0].upper(), parts[1].upper()); await update.message.reply_text(r); return
 
-    # planner quick add: handled via /plan
     # mood detection and store
     m = mood_from_text(text); set_user_mood(uid, m)
 
@@ -808,7 +776,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         cur.execute("INSERT INTO unsent_messages(user_id,text,ts,tries) VALUES(?,?,?,0)", (uid, reply, int(time.time()))); conn.commit()
 
-# helper checks
+# is_verified helper
 def is_verified(user_id:int)->bool:
     u = get_user(user_id)
     if not u or not u.get("verified_at"):
@@ -820,12 +788,7 @@ async def setlang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: await update.message.reply_text("Usage: /setlang <lang_code> (e.g., /setlang en)"); return
     code = context.args[0].lower(); set_user_lang(update.effective_user.id, code); await update.message.reply_text(f"Language set to {code}")
 
-# helper to get due plans
-def get_due_plans(now_ts:int):
-    cur.execute("SELECT id,user_id,note,remind_at FROM planner WHERE remind_at <= ?", (now_ts,))
-    return cur.fetchall()
-
-# scheduler - daily briefing and planner reminders
+# daily briefing & scheduler
 def daily_briefing(app):
     cur.execute("SELECT user_id FROM users WHERE verified_at IS NOT NULL")
     rows = cur.fetchall()
@@ -845,34 +808,68 @@ def run_scheduler(app):
             time.sleep(61)
         time.sleep(10)
 
-# build and run
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    # handlers
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(CommandHandler("verify", verify_cmd))
-    app.add_handler(CommandHandler("code", code_cmd))
-    app.add_handler(CommandHandler("imei", imei_cmd))
-    app.add_handler(CommandHandler("rate", rate_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("users", users_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("plan", plan_cmd))
-    app.add_handler(CommandHandler("feedback", feedback_cmd))
-    app.add_handler(CommandHandler("setlang", setlang_cmd))
-    app.add_handler(CommandHandler("logs", logs_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+# Build Telegram application and run polling in background thread, while exposing FastAPI app
+telegram_app = None
 
-    # background threads
-    t = threading.Thread(target=retry_queues, args=(app,), daemon=True); t.start()
-    s = threading.Thread(target=run_scheduler, args=(app,), daemon=True); s.start()
-    start_keepalive_server(); start_keepalive_pinger()
+def start_telegram_polling_in_thread():
+    global telegram_app
+    telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # register handlers
+    telegram_app.add_handler(CommandHandler("start", start_handler))
+    telegram_app.add_handler(CallbackQueryHandler(callback_handler))
+    telegram_app.add_handler(CommandHandler("verify", verify_cmd))
+    telegram_app.add_handler(CommandHandler("code", code_cmd))
+    telegram_app.add_handler(CommandHandler("imei", lambda u,c: telegram_app.create_task(imei_cmd(u,c))))
+    telegram_app.add_handler(CommandHandler("rate", lambda u,c: telegram_app.create_task(rate_cmd(u,c))))
+    telegram_app.add_handler(CommandHandler("help", lambda u,c: telegram_app.create_task(help_cmd(u,c))))
+    telegram_app.add_handler(CommandHandler("stats", lambda u,c: telegram_app.create_task(stats_cmd(u,c))))
+    telegram_app.add_handler(CommandHandler("users", lambda u,c: telegram_app.create_task(users_cmd(u,c))))
+    telegram_app.add_handler(CommandHandler("broadcast", lambda u,c: telegram_app.create_task(broadcast_cmd(u,c))))
+    telegram_app.add_handler(CommandHandler("plan", lambda u,c: telegram_app.create_task(plan_cmd(u,c))))
+    telegram_app.add_handler(CommandHandler("feedback", lambda u,c: telegram_app.create_task(feedback_cmd(u,c))))
+    telegram_app.add_handler(CommandHandler("setlang", lambda u,c: telegram_app.create_task(setlang_cmd(u,c))))
+    telegram_app.add_handler(CommandHandler("logs", lambda u,c: telegram_app.create_task(logs_cmd(u,c))))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: telegram_app.create_task(text_handler(u,c))))
 
-    logger.info("Starting Werleed Assistant (full) — polling...")
-    app.run_polling()
+    # start background retries and scheduler
+    t_retry = threading.Thread(target=retry_queues, args=(telegram_app,), daemon=True); t_retry.start()
+    t_sched = threading.Thread(target=run_scheduler, args=(telegram_app,), daemon=True); t_sched.start()
+    start_keepalive_pinger()
 
+    # run polling (blocking) in thread
+    def run_polling():
+        logger.info("Starting telegram polling thread...")
+        telegram_app.run_polling()
+    th = threading.Thread(target=run_polling, daemon=True)
+    th.start()
+    logger.info("Telegram polling started in background thread")
+
+# build FastAPI app for Render
+app = FastAPI()
+
+@app.on_event("startup")
+def on_startup():
+    # start telegram polling thread
+    try:
+        start_telegram_polling_in_thread()
+    except Exception:
+        logger.exception("Failed to start telegram polling")
+    # restore backups
+    try:
+        restore_users_from_json()
+    except Exception:
+        pass
+
+@app.get("/healthz")
+def healthz():
+    return {"status":"ok","bot":BOT_NAME}
+
+@app.get("/")
+def root():
+    return {"status":"ok","bot":BOT_NAME}
+
+# local helper start when module run (useful for local dev)
 if __name__ == "__main__":
-    main()
-    
+    start_telegram_polling_in_thread()
+    # uvicorn fallback if someone runs python main.py locally
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
