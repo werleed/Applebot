@@ -1,6 +1,9 @@
-python-telegram-bot==13.15
-fastapi==0.95.2
-uvicorn==0.22.0
+python-telegram-bot==20.3
+twilio==8.5.0
+deep-translator==1.11.4
+langdetect==1.0.9
+beautifulsoup4==4.12.2
 requests==2.31.0
 python-dotenv==1.0.0
-twilio==8.5.0
+fastapi==0.95.2
+uvicorn==0.22.0
